@@ -1,132 +1,239 @@
-// server.js - Main server file for Socket.io chat application
-
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const socketIo = require('socket.io');
 const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"]
+  }
 });
 
-// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+// In-memory storage (in production, use a database)
+let users = [];
+let messages = [];
+let onlineUsers = new Set();
+let typingUsers = new Set();
 
-// Socket.io connection handler
+// JWT Secret
+const JWT_SECRET = 'your-secret-key';
+
+// Middleware to verify JWT
+const verifyToken = (token) => {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (error) {
+    return null;
+  }
+};
+
+// Socket.io connection handling
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log('User connected:', socket.id);
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
-
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
+  // User authentication
+  socket.on('authenticate', (data) => {
+    const { token } = data;
+    const user = verifyToken(token);
+    if (user) {
+      socket.userId = user.id;
+      socket.username = user.username;
+      onlineUsers.add(user.id);
+      io.emit('user_online', { userId: user.id, username: user.username });
+      socket.emit('authenticated', { success: true });
+    } else {
+      socket.emit('authenticated', { success: false });
     }
-    
-    io.emit('receive_message', message);
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
+  // Join room
+  socket.on('join_room', (roomId) => {
+    socket.join(roomId);
+    socket.currentRoom = roomId;
+    socket.emit('joined_room', roomId);
+  });
+
+  // Send message
+  socket.on('send_message', (data) => {
+    const { message, roomId, recipientId } = data;
+    const newMessage = {
+      id: uuidv4(),
+      senderId: socket.userId,
+      senderUsername: socket.username,
+      content: message,
+      timestamp: new Date(),
+      roomId: roomId || 'global',
+      recipientId,
+      readBy: [socket.userId],
+      reactions: []
+    };
+
+    messages.push(newMessage);
+
+    if (recipientId) {
+      // Private message
+      io.to(recipientId).emit('receive_message', newMessage);
+      socket.emit('receive_message', newMessage);
+    } else {
+      // Room message
+      io.to(roomId || 'global').emit('receive_message', newMessage);
+    }
+
+    // Notification
+    if (recipientId && recipientId !== socket.userId) {
+      io.to(recipientId).emit('notification', {
+        type: 'new_message',
+        message: `New message from ${socket.username}`,
+        messageId: newMessage.id
+      });
+    }
+  });
+
+  // Typing indicator
+  socket.on('typing_start', (data) => {
+    const { roomId } = data;
+    typingUsers.add(socket.userId);
+    socket.to(roomId || 'global').emit('user_typing', {
+      userId: socket.userId,
+      username: socket.username,
+      isTyping: true
+    });
+  });
+
+  socket.on('typing_stop', (data) => {
+    const { roomId } = data;
+    typingUsers.delete(socket.userId);
+    socket.to(roomId || 'global').emit('user_typing', {
+      userId: socket.userId,
+      username: socket.username,
+      isTyping: false
+    });
+  });
+
+  // Mark message as read
+  socket.on('mark_read', (messageId) => {
+    const message = messages.find(m => m.id === messageId);
+    if (message && !message.readBy.includes(socket.userId)) {
+      message.readBy.push(socket.userId);
+      io.emit('message_read', { messageId, userId: socket.userId });
+    }
+  });
+
+  // Add reaction
+  socket.on('add_reaction', (data) => {
+    const { messageId, reaction } = data;
+    const message = messages.find(m => m.id === messageId);
+    if (message) {
+      const existingReaction = message.reactions.find(r => r.userId === socket.userId);
+      if (existingReaction) {
+        existingReaction.emoji = reaction;
       } else {
-        delete typingUsers[socket.id];
+        message.reactions.push({ userId: socket.userId, emoji: reaction });
       }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+      io.to(message.roomId || 'global').emit('reaction_added', {
+        messageId,
+        reaction: { userId: socket.userId, emoji: reaction }
+      });
     }
   });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
+  // File sharing
+  socket.on('send_file', (data) => {
+    const { fileName, fileData, roomId, recipientId } = data;
+    const newMessage = {
+      id: uuidv4(),
+      senderId: socket.userId,
+      senderUsername: socket.username,
+      content: `Shared file: ${fileName}`,
+      fileName,
+      fileData,
+      timestamp: new Date(),
+      roomId: roomId || 'global',
+      recipientId,
+      type: 'file',
+      readBy: [socket.userId],
+      reactions: []
     };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
-  });
 
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
+    messages.push(newMessage);
+
+    if (recipientId) {
+      io.to(recipientId).emit('receive_message', newMessage);
+      socket.emit('receive_message', newMessage);
+    } else {
+      io.to(roomId || 'global').emit('receive_message', newMessage);
     }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+  });
+
+  // Get messages
+  socket.on('get_messages', (data) => {
+    const { roomId, page = 1, limit = 50 } = data;
+    const roomMessages = messages.filter(m => m.roomId === roomId || (!roomId && m.roomId === 'global'));
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedMessages = roomMessages.slice(-endIndex).reverse();
+    socket.emit('messages_history', { messages: paginatedMessages, hasMore: roomMessages.length > endIndex });
+  });
+
+  // Search messages
+  socket.on('search_messages', (query) => {
+    const results = messages.filter(m =>
+      m.content.toLowerCase().includes(query.toLowerCase()) &&
+      (m.roomId === socket.currentRoom || m.recipientId === socket.userId || m.senderId === socket.userId)
+    );
+    socket.emit('search_results', results);
+  });
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+    if (socket.userId) {
+      onlineUsers.delete(socket.userId);
+      io.emit('user_offline', { userId: socket.userId, username: socket.username });
+    }
+    typingUsers.delete(socket.userId);
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
+// API Routes
+app.post('/register', async (req, res) => {
+  const { username, password } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const user = {
+    id: uuidv4(),
+    username,
+    password: hashedPassword
+  };
+  users.push(user);
+  res.json({ success: true });
 });
 
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = users.find(u => u.username === username);
+  if (user && await bcrypt.compare(password, user.password)) {
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
+    res.json({ success: true, token, user: { id: user.id, username: user.username } });
+  } else {
+    res.status(401).json({ success: false, message: 'Invalid credentials' });
+  }
 });
 
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
+app.get('/users', (req, res) => {
+  const userList = users.map(u => ({ id: u.id, username: u.username, online: onlineUsers.has(u.id) }));
+  res.json(userList);
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 6000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = { app, server, io }; 
